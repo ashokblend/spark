@@ -24,6 +24,14 @@ import org.apache.spark.SparkContext
 import org.apache.spark.scheduler.AccumulableInfo
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2, Utils}
 
+/**
+ * It holds aggregated sql metrics data. this data can be of
+ * a. no of scanned rows
+ * b. memory consumed
+ * e.tc
+ */
+case class MetricsData(sum: Long, min: Option[Long] = None,
+    med: Option[Long] = None, max: Option[Long] = None)
 
 class SQLMetric(val metricType: String, initValue: Long = 0L) extends AccumulatorV2[Long, Long] {
   // This is a workaround for SPARK-11013.
@@ -126,4 +134,64 @@ object SQLMetrics {
       s"\n$sum ($min, $med, $max)"
     }
   }
+
+  def metricsStringValue(metricsType: String, value: MetricsData): String = {
+    if (metricsType == SUM_METRIC) {
+      val numberFormat = NumberFormat.getIntegerInstance(Locale.US)
+      numberFormat.format(value.sum)
+    } else {
+      val strFormat: Long => String = if (metricsType == SIZE_METRIC) {
+        Utils.bytesToString
+      } else if (metricsType == TIMING_METRIC) {
+        Utils.msDurationToString
+      } else {
+        throw new IllegalStateException("unexpected metrics type: " + metricsType)
+      }
+      val Seq(sum, min, med, max) = {
+        val metric = {
+          Seq(value.sum, value.min.get, value.med.get, value.max.get)
+        }
+        metric.map(strFormat)
+      }
+      val result = s"\n$sum ($min, $med, $max)"
+      result
+    }
+  }
+
+  def mergeMetrics(metricsType: String, values: Seq[Long]): MetricsData = {
+    if (metricsType == SUM_METRIC) {
+      MetricsData(values.sum)
+    } else {
+      val validValues = values.filter(_ >= 0)
+      val Seq(sum, min, med, max) = {
+        if (validValues.isEmpty) {
+          Seq.fill(4)(0L)
+        } else {
+          val sorted = validValues.sorted
+          Seq(sorted.sum, sorted(0), sorted(validValues.length / 2), sorted(validValues.length - 1))
+        }
+      }
+      MetricsData(sum, Some(min), Some(med), Some(max))
+    }
+  }
+
+  def mergeMetricsData(metricsType: String, values: Seq[MetricsData]): MetricsData = {
+   val metricsSum = values.map(_.sum)
+   if (metricsType == SUM_METRIC) {
+     MetricsData(metricsSum.sum)
+   } else {
+     val Seq(sum, min, med, max) = {
+       val minSorted = values.map(_.min.get).sorted
+       val medSorted = values.map(_.med.get).sorted
+       val maxSorted = values.map(_.max.get).sorted
+
+       val metricsSorted = metricsSum.sorted
+       Seq(metricsSorted.sum,
+           minSorted(0),
+           medSorted(medSorted.length / 2),
+           maxSorted(maxSorted.length - 1))
+     }
+     MetricsData(sum, Some(min), Some(med), Some(max))
+   }
+ }
 }

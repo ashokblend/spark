@@ -106,7 +106,13 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
    */
   private val _jobIdToExecutionId = mutable.HashMap[Long, Long]()
 
-  private val _stageIdToStageMetrics = mutable.HashMap[Long, SQLStageMetrics]()
+  private val _runningStageIdToStageMetrics = mutable.HashMap[Long, SQLStageMetrics]()
+
+  private val _finishedStageIdToStageMetrics = mutable.HashMap[Long, SQLStageMetrics]()
+
+  // Store the merged metrics in each executionId.
+  // Map[executionId -> Map[accumulatorId, SQLMetricValue]]
+  private val mergedMetrics = mutable.HashMap[Long, Map[Long, MetricsData]]()
 
   private val failedExecutions = mutable.ListBuffer[SQLExecutionUIData]()
 
@@ -121,7 +127,7 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
   }
 
   def stageIdToStageMetrics: Map[Long, SQLStageMetrics] = synchronized {
-    _stageIdToStageMetrics.toMap
+    _runningStageIdToStageMetrics.toMap.toMap
   }
 
   private def trimExecutionsIfNecessary(
@@ -134,7 +140,7 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
             _jobIdToExecutionId.remove(jobId)
           }
           for (stageId <- executionUIData.stages) {
-            _stageIdToStageMetrics.remove(stageId)
+            _runningStageIdToStageMetrics.remove(stageId)
           }
         }
       }
@@ -157,7 +163,7 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
         executionUIData.jobs(jobId) = JobExecutionStatus.RUNNING
         executionUIData.stages ++= stageIds
         stageIds.foreach(stageId =>
-          _stageIdToStageMetrics(stageId) = new SQLStageMetrics(stageAttemptId = 0))
+          _runningStageIdToStageMetrics(stageId) = new SQLStageMetrics(stageAttemptId = 0))
         _jobIdToExecutionId(jobId) = executionId
       }
     }
@@ -191,11 +197,12 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
     val stageId = stageSubmitted.stageInfo.stageId
     val stageAttemptId = stageSubmitted.stageInfo.attemptId
     // Always override metrics for old stage attempt
-    if (_stageIdToStageMetrics.contains(stageId)) {
-      _stageIdToStageMetrics(stageId) = new SQLStageMetrics(stageAttemptId)
+    if (_runningStageIdToStageMetrics.contains(stageId)) {
+      _runningStageIdToStageMetrics(stageId) = new SQLStageMetrics(stageAttemptId)
     } else {
       // If a stage belongs to some SQL execution, its stageId will be put in "onJobStart".
-      // Since "_stageIdToStageMetrics" doesn't contain it, it must not belong to any SQL execution.
+      // Since "_runningStageIdToStageMetrics" doesn't contain it,
+      // it must not belong to any SQL execution.
       // So we can ignore it. Otherwise, this may lead to memory leaks (SPARK-11126).
     }
   }
@@ -208,6 +215,18 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
         taskEnd.stageAttemptId,
         taskEnd.taskMetrics.externalAccums.map(a => a.toInfo(Some(a.value), None)),
         finishTask = true)
+        _runningStageIdToStageMetrics.get(taskEnd.stageId).foreach { stageMetrics =>
+      if (taskEnd.stageAttemptId == stageMetrics.stageAttemptId) {
+        stageMetrics.taskIdToMetricUpdates.remove(taskEnd.taskInfo.taskId).foreach { taskMetrics =>
+          _finishedStageIdToStageMetrics.getOrElseUpdate(taskEnd.stageId,
+            new SQLStageMetrics(stageMetrics.stageAttemptId))
+            .taskIdToMetricUpdates(taskEnd.taskInfo.taskId) = taskMetrics
+        }
+      }
+     }
+     if (_finishedStageIdToStageMetrics.values.map(_.taskIdToMetricUpdates.size).sum > 10000) {
+       add()
+     }
     }
   }
 
@@ -224,7 +243,7 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
     val accumulatorUpdates =
       _accumulatorUpdates.filter(_.update.isDefined).map(accum => (accum.id, accum.update.get))
 
-    _stageIdToStageMetrics.get(stageId) match {
+    _runningStageIdToStageMetrics.get(stageId) match {
       case Some(stageMetrics) =>
         if (stageAttemptID < stageMetrics.stageAttemptId) {
           // A task of an old stage attempt. Because a new stage is submitted, we can ignore it.
@@ -330,15 +349,23 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
     _executionIdToData.get(executionId)
   }
 
-  /**
-   * Get all accumulator updates from all tasks which belong to this execution and merge them.
-   */
-  def getExecutionMetrics(executionId: Long): Map[Long, String] = synchronized {
-    _executionIdToData.get(executionId) match {
+  private def add() = {
+    for (executionId <- _executionIdToData.keys) {
+      val mergedResult =
+        merge(executionId, stageId => _finishedStageIdToStageMetrics.remove(stageId))
+
+      mergedMetrics += (executionId -> mergedResult)
+    }
+  }
+
+  private def merge(
+      executionId: Long,
+      stageMetrics: Int => Option[SQLStageMetrics]): Map[Long, MetricsData] = {
+    val newResult: Map[Long, MetricsData] = _executionIdToData.get(executionId) match {
       case Some(executionUIData) =>
         val accumulatorUpdates = {
           for (stageId <- executionUIData.stages;
-               stageMetrics <- _stageIdToStageMetrics.get(stageId).toIterable;
+               stageMetrics <- stageMetrics(stageId).toIterable;
                taskMetrics <- stageMetrics.taskIdToMetricUpdates.values;
                accumulatorUpdate <- taskMetrics.accumulatorUpdates) yield {
             (accumulatorUpdate._1, accumulatorUpdate._2)
@@ -352,15 +379,49 @@ class SQLListener(conf: SparkConf) extends SparkListener with Logging {
         // This execution has been dropped
         Map.empty
     }
+    val mergedResult: Map[Long, MetricsData] = mergedMetrics.get(executionId) match {
+      case Some(oldResult) =>
+        _executionIdToData.get(executionId) match {
+          case Some(executionUIData) =>
+            (oldResult.toSeq ++ newResult.toSeq)
+            .groupBy(_._1)
+            .map {
+              case(accumulatorId, values) =>
+                val metricsData = values.map(_._2)
+                val metricType = executionUIData.accumulatorMetrics(accumulatorId).metricType
+                accumulatorId -> SQLMetrics.mergeMetricsData(metricType, metricsData)
+             }
+          case None => newResult
+        }
+      case None =>
+        newResult
+    }
+    mergedResult
+  }
+  /**
+   * Get all accumulator updates from all tasks which belong to this execution and merge them.
+   */
+  def getExecutionMetrics(executionId: Long): Map[Long, String] = synchronized {
+    add()
+    _executionIdToData.get(executionId) match {
+      case Some(executionUIData) =>
+        val mergedData = merge(executionId, stageId => _runningStageIdToStageMetrics.get(stageId))
+        mergedData.map { x =>
+          (x._1, SQLMetrics
+              .metricsStringValue(executionUIData.accumulatorMetrics(x._1).metricType, x._2))
+        }
+      case None =>
+        // This execution has been dropped
+        Map.empty
+    }
   }
 
   private def mergeAccumulatorUpdates(
       accumulatorUpdates: Seq[(Long, Any)],
-      metricTypeFunc: Long => String): Map[Long, String] = {
+      metricTypeFunc: Long => String): Map[Long, MetricsData] = {
     accumulatorUpdates.groupBy(_._1).map { case (accumulatorId, values) =>
       val metricType = metricTypeFunc(accumulatorId)
-      accumulatorId ->
-        SQLMetrics.stringValue(metricType, values.map(_._2.asInstanceOf[Long]))
+      accumulatorId -> SQLMetrics.mergeMetrics(metricType, values.map(_._2.asInstanceOf[Long]))
     }
   }
 
